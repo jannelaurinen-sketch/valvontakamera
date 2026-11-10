@@ -11,7 +11,7 @@ import java.net.URLEncoder
 
 /**
  * Lähettää kuvat, videot ja viestit Telegram-botin kautta.
- * Lähetettävät asiat kirjoitetaan jonoon (filesDir/outbox/*.job), joten mitään ei katoa
+ * Lähetettävät asiat kirjoitetaan jonoon (filesDir/outbox, .job-tiedostot), joten mitään ei katoa
  * vaikka Wi-Fi katkeaisi hetkeksi: lähetystä yritetään uudelleen 30 s välein.
  */
 object Telegram {
