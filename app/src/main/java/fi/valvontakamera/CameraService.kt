@@ -69,8 +69,8 @@ class CameraService : LifecycleService() {
         const val SEG_MS = 30_000L          // normaali pätkän pituus
         const val SEG_MAX_MS = 180_000L     // liikkeen aikana pätkää jatketaan enintään tähän asti
         const val PRE_MS = 2_000L           // esitallennus
-        const val POST_MS = 2_000L          // jälkitallennus
-        const val QUIET_MS = 6_000L         // tapahtuma päättyy kun liikettä ei ole näkynyt näin pitkään
+        const val POST_MS = 2_000L          // jälkitallennus viimeisen liikkeen jälkeen
+        const val QUIET_MS = 2_000L         // tapahtuma päättyy kun liikettä ei ole näkynyt näin pitkään
         const val CLIP_MAX_MS = 120_000L    // Telegram-klipin maksimipituus
         const val MIN_FREE = 4_000_000_000L
         private const val NOTIF_ID = 1
