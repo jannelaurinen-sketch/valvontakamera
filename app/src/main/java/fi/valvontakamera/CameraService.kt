@@ -68,10 +68,10 @@ class CameraService : LifecycleService() {
         const val EXTRA_ROT = "rot"
         const val SEG_MS = 30_000L          // normaali pätkän pituus
         const val SEG_MAX_MS = 180_000L     // liikkeen aikana pätkää jatketaan enintään tähän asti
-        const val PRE_MS = 8_000L           // esitallennus
-        const val POST_MS = 8_000L          // jälkitallennus
+        const val PRE_MS = 2_000L           // esitallennus
+        const val POST_MS = 2_000L          // jälkitallennus
         const val QUIET_MS = 6_000L         // tapahtuma päättyy kun liikettä ei ole näkynyt näin pitkään
-        const val CLIP_MAX_MS = 90_000L     // Telegram-klipin maksimipituus
+        const val CLIP_MAX_MS = 120_000L    // Telegram-klipin maksimipituus
         const val MIN_FREE = 4_000_000_000L
         private const val NOTIF_ID = 1
         private const val CH = "valvonta"
@@ -118,7 +118,8 @@ class CameraService : LifecycleService() {
     private val pendingSegs = ArrayList<Seg>()
     private val keptSegs = ArrayList<Seg>()
     private val recentEvents = ArrayList<LongArray>()
-    private val pendingClips = ArrayList<LongArray>()
+    private val pendingClips = ArrayList<LongArray>()   // start, end, vastattava viesti-id
+    private val requested = HashMap<Long, Long>()      // tapahtuman alku -> pyyntöaika
     private var activeEventStart = 0L
     private var transforming = false
     private var wakeLock: PowerManager.WakeLock? = null
@@ -136,7 +137,12 @@ class CameraService : LifecycleService() {
     private var evStart = 0L
     private var evLast = 0L
     private var evPeak = 0f
-    private var evStill = ""
+    private var bestNv21: ByteArray? = null
+    private var bestW = 0
+    private var bestH = 0
+    private var bestRot = 0
+    private var bestAt = 0L
+    private var lastGrab = 0L
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
@@ -164,6 +170,7 @@ class CameraService : LifecycleService() {
         Storage.cleanup(this, Prefs.keepNights(this), MIN_FREE)
         Storage.appendSession(this, "S", System.currentTimeMillis())
         Telegram.text(this, "📹 Valvonta käynnistyi")
+        Telegram.startPolling(this) { cb -> main.post { onVideoRequest(cb) } }
 
         val f = ProcessCameraProvider.getInstance(this)
         f.addListener({
@@ -375,6 +382,21 @@ class CameraService : LifecycleService() {
 
     // ------------------------------------------------------------------ Telegram-klipit
 
+    /** Joku painoi Telegramissa "Lataa video" -painiketta. */
+    private fun onVideoRequest(cb: Telegram.Callback) {
+        val parts = cb.data.split(':')
+        if (parts.size < 3 || parts[0] != "v") return
+        val st = parts[1].toLongOrNull() ?: return
+        val en = parts[2].toLongOrNull() ?: return
+        val now = System.currentTimeMillis()
+        val prev = requested[st]
+        if (prev != null && now - prev < 10 * 60_000L) return   // sama video jo pyydetty
+        requested[st] = now
+        requested.entries.removeAll { now - it.value > 3_600_000L }
+        pendingClips.add(longArrayOf(st, en, cb.msgId))
+        processClips()
+    }
+
     private fun processClips() {
         if (transforming || pendingClips.isEmpty()) return
         val ev = pendingClips[0]
@@ -383,14 +405,17 @@ class CameraService : LifecycleService() {
         if (activeRecStart <= ce) return                  // jakso vielä nauhoituksessa
         if (pendingSegs.any { it.start <= ce && it.end >= cs }) return
         pendingClips.removeAt(0)
-        val segs = keptSegs.filter { it.start < ce && it.end > cs }.sortedBy { it.start }
-        if (segs.isEmpty()) { processClips(); return }
+        val segs = Storage.readSegments(Storage.nightDir(this, ev[0])).filter { it.start < ce && it.end > cs }
+        if (segs.isEmpty()) {
+            Telegram.text(this, "Video ${Fmt.time(ev[0])} ei ole enää tallessa.")
+            processClips(); return
+        }
         transforming = true
         val out = File(cacheDir, "klippi_${ev[0]}.mp4")
         val caption = "🎬 ${Fmt.time(ev[0])}–${Fmt.time(ev[1])} (${(ev[1] - ev[0]) / 1000 + 1} s)"
         ClipMaker.make(this, segs, cs, ce, out) { ok, err ->
             transforming = false
-            if (ok && out.exists()) Telegram.video(this, out, caption)
+            if (ok && out.exists()) Telegram.video(this, out, caption, ev[2])
             else {
                 out.delete()
                 Telegram.text(this, "Videon pakkaus epäonnistui (${Fmt.time(ev[0])}): $err")
@@ -428,19 +453,25 @@ class CameraService : LifecycleService() {
 
             if (r.triggered) {
                 if (evStart == 0L) {
-                    evStart = now; evPeak = 0f
-                    val still = try { saveStill(image, now) } catch (t: Throwable) { Log.w(TAG, "still", t); null }
-                    evStill = still?.name ?: ""
-                    main.post { onEventStart(now, still) }
+                    evStart = now; evPeak = 0f; bestAt = 0L; lastGrab = 0L
+                    main.post { onEventStart(now) }
                 }
                 evLast = now
                 lastMotionAt = now
-                if (r.score > evPeak) evPeak = r.score
+                if (r.score > evPeak) {
+                    evPeak = r.score
+                    // talteen kuva kohdasta, jossa liikettä on eniten
+                    if (bestAt == 0L || now - lastGrab > 300) {
+                        lastGrab = now
+                        try { grabBest(image, now) } catch (t: Throwable) { Log.w(TAG, "grab", t) }
+                    }
+                }
             }
             if (evStart != 0L && now - evLast > QUIET_MS) {
-                val e = Ev(evStart, evLast, evPeak, evStill)
+                val still = try { if (bestAt != 0L) saveBest() else null } catch (t: Throwable) { Log.w(TAG, "still", t); null }
+                val e = Ev(evStart, evLast, evPeak, still?.name ?: "")
                 evStart = 0L
-                main.post { onEventEnd(e) }
+                main.post { onEventEnd(e, still) }
             }
         } catch (t: Throwable) {
             Log.e(TAG, "analyze", t)
@@ -449,19 +480,23 @@ class CameraService : LifecycleService() {
         }
     }
 
-    private fun onEventStart(t: Long, still: File?) {
+    private fun onEventStart(t: Long) {
         if (!running || stopping) return
         activeEventStart = t
         eventsCount++
-        if (still != null) Telegram.photo(this, still, "🚶 Liikettä ${Fmt.dateTime(t)}")
         updateNotif()
     }
 
-    private fun onEventEnd(e: Ev) {
+    private fun onEventEnd(e: Ev, still: File?) {
         if (!running || stopping) return
         recentEvents.add(longArrayOf(e.start, e.end))
         Storage.appendEvent(this, e)
-        if (Telegram.enabled(this)) pendingClips.add(longArrayOf(e.start, e.end))
+        if (still != null) {
+            val dur = (e.end - e.start) / 1000 + 1
+            Telegram.photo(this, still,
+                "🚶 Liikettä ${Fmt.dateTime(e.start)} – ${Fmt.time(e.end)} ($dur s)",
+                "📥 Lataa video ($dur s)", "v:${e.start}:${e.end}")
+        }
         if (activeEventStart == e.start) activeEventStart = 0L
         decideSegments()
         processClips()
@@ -504,17 +539,25 @@ class CameraService : LifecycleService() {
         return bmp
     }
 
-    /** Tallentaa tapahtuman alun kuvan JPEG-tiedostoksi aikaleiman kanssa. */
-    private fun saveStill(image: ImageProxy, now: Long): File {
+    /** Kopioi nykyisen kuvan talteen (tapahtuman suurin liike tähän mennessä). */
+    private fun grabBest(image: ImageProxy, now: Long) {
         val w = image.width and 1.inv()
         val h = image.height and 1.inv()
-        val nv21 = toNv21(image, w, h)
+        var buf = bestNv21
+        if (buf == null || buf.size != w * h * 3 / 2) { buf = ByteArray(w * h * 3 / 2); bestNv21 = buf }
+        toNv21(image, w, h, buf)
+        bestW = w; bestH = h; bestRot = image.imageInfo.rotationDegrees; bestAt = now
+    }
+
+    /** Tallentaa talteen otetun kuvan JPEG-tiedostoksi aikaleiman kanssa. */
+    private fun saveBest(): File {
+        val nv21 = bestNv21!!
+        val w = bestW; val h = bestH; val now = bestAt
         val baos = ByteArrayOutputStream()
         YuvImage(nv21, ImageFormat.NV21, w, h, null).compressToJpeg(Rect(0, 0, w, h), 92, baos)
         var bmp = BitmapFactory.decodeByteArray(baos.toByteArray(), 0, baos.size())
-        val rot = image.imageInfo.rotationDegrees
-        bmp = if (rot != 0)
-            Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(rot.toFloat()) }, true)
+        bmp = if (bestRot != 0)
+            Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(bestRot.toFloat()) }, true)
         else bmp.copy(Bitmap.Config.ARGB_8888, true)
         if (!bmp.isMutable) bmp = bmp.copy(Bitmap.Config.ARGB_8888, true)
         val c = Canvas(bmp)
@@ -529,8 +572,7 @@ class CameraService : LifecycleService() {
         return f
     }
 
-    private fun toNv21(image: ImageProxy, w: Int, h: Int): ByteArray {
-        val out = ByteArray(w * h * 3 / 2)
+    private fun toNv21(image: ImageProxy, w: Int, h: Int, out: ByteArray) {
         val yP = image.planes[0]; val uP = image.planes[1]; val vP = image.planes[2]
         val yb = yP.buffer; val yrs = yP.rowStride; val yps = yP.pixelStride
         var pos = 0
@@ -554,7 +596,6 @@ class CameraService : LifecycleService() {
             out[pos++] = if (vo < vlim) vb.get(vo) else 128.toByte()
             out[pos++] = if (uo < ulim) ub.get(uo) else 128.toByte()
         }
-        return out
     }
 
     // ------------------------------------------------------------------ ylläpito
@@ -637,6 +678,7 @@ class CameraService : LifecycleService() {
         try { camera?.cameraControl?.enableTorch(false) } catch (_: Throwable) {}
         try { provider?.unbindAll() } catch (_: Throwable) {}
         analysisExec.shutdown()
+        Telegram.stopPolling()
         try { wakeLock?.release() } catch (_: Throwable) {}
         try { wifiLock?.release() } catch (_: Throwable) {}
         super.onDestroy()

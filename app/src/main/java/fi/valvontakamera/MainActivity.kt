@@ -143,7 +143,7 @@ class MainActivity : Activity() {
         // ---------------- Telegram
         col.add(header("Telegram"))
         col.add(Switch(this).apply {
-            text = "Lähetä kuva ja videoklippi Telegramiin"
+            text = "Lähetä hälytyskuvat Telegramiin (video \"Lataa video\" -painikkeella)"
             setTextColor(Color.WHITE)
             isChecked = Prefs.tgEnabled(this@MainActivity)
             setOnCheckedChangeListener { _, on -> Prefs.setTgEnabled(this@MainActivity, on) }

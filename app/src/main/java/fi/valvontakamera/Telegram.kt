@@ -2,6 +2,7 @@ package fi.valvontakamera
 
 import android.content.Context
 import android.util.Log
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.DataOutputStream
 import java.io.File
@@ -29,20 +30,32 @@ object Telegram {
 
     private fun outbox(c: Context) = File(c.filesDir, "outbox").apply { mkdirs() }
 
-    private fun enqueue(c: Context, kind: String, path: String, caption: String) {
+    /** Jonotiedoston muoto: tyyppi \n polku \n lisätieto \n kuvateksti */
+    private fun enqueue(c: Context, kind: String, path: String, extra: String, caption: String) {
         if (!enabled(c)) return
         val dir = outbox(c)
         val name = synchronized(lock) { "%d_%04d".format(System.currentTimeMillis(), seq++ % 10000) }
         val tmp = File(dir, "$name.tmp")
-        tmp.writeText("$kind\n$path\n$caption")
+        tmp.writeText("$kind\n$path\n${extra.replace("\n", " ")}\n$caption")
         tmp.renameTo(File(dir, "$name.job"))
         kick(c)
     }
 
-    fun photo(c: Context, f: File, caption: String) = enqueue(c, "p", f.absolutePath, caption)
-    /** Video poistetaan lähetyksen jälkeen. */
-    fun video(c: Context, f: File, caption: String) = enqueue(c, "v", f.absolutePath, caption)
-    fun text(c: Context, msg: String) = enqueue(c, "t", "", msg)
+    /** Kuva, jonka alla painike (esim. "Lataa video"); painalluksesta tulee [Callback] jonka data = [buttonData]. */
+    fun photo(c: Context, f: File, caption: String, buttonText: String? = null, buttonData: String? = null) {
+        val markup = if (buttonText != null && buttonData != null) {
+            JSONObject().put("inline_keyboard",
+                JSONArray().put(JSONArray().put(JSONObject().put("text", buttonText).put("callback_data", buttonData))))
+                .toString()
+        } else ""
+        enqueue(c, "p", f.absolutePath, markup, caption)
+    }
+
+    /** Video poistetaan lähetyksen jälkeen. [replyTo] = viesti, johon video liitetään vastauksena. */
+    fun video(c: Context, f: File, caption: String, replyTo: Long = 0) =
+        enqueue(c, "v", f.absolutePath, if (replyTo > 0) replyTo.toString() else "", caption)
+
+    fun text(c: Context, msg: String) = enqueue(c, "t", "", "", msg)
 
     fun kick(c: Context) {
         val app = c.applicationContext
@@ -84,21 +97,27 @@ object Telegram {
 
     private fun send(c: Context, job: File): Int {
         if (!enabled(c)) return DROP
-        val lines = job.readText().split("\n", limit = 3)
-        if (lines.size < 3) return DROP
-        val (kind, path, caption) = lines
+        val lines = job.readText().split("\n", limit = 4)
+        if (lines.size < 4) return DROP
+        val kind = lines[0]; val path = lines[1]; val extra = lines[2]; val caption = lines[3]
         val token = Prefs.tgToken(c)
         val chat = Prefs.tgChat(c)
         val (code, body) = when (kind) {
             "t" -> post(token, "sendMessage", mapOf("chat_id" to chat, "text" to caption), null, null, null)
             "p" -> {
                 val f = File(path); if (!f.exists()) return DROP
-                post(token, "sendPhoto", mapOf("chat_id" to chat, "caption" to caption), "photo", f, "image/jpeg")
+                val fields = linkedMapOf("chat_id" to chat, "caption" to caption)
+                if (extra.isNotEmpty()) fields["reply_markup"] = extra
+                post(token, "sendPhoto", fields, "photo", f, "image/jpeg")
             }
             "v" -> {
                 val f = File(path); if (!f.exists()) return DROP
-                post(token, "sendVideo", mapOf("chat_id" to chat, "caption" to caption, "supports_streaming" to "true"),
-                    "video", f, "video/mp4")
+                val fields = linkedMapOf("chat_id" to chat, "caption" to caption, "supports_streaming" to "true")
+                if (extra.isNotEmpty()) {
+                    fields["reply_to_message_id"] = extra
+                    fields["allow_sending_without_reply"] = "true"
+                }
+                post(token, "sendVideo", fields, "video", f, "video/mp4")
             }
             else -> return DROP
         }
@@ -147,6 +166,12 @@ object Telegram {
 
     /** Hakee botin näkemät keskustelut ja ryhmät: lista (id, nimi). Kutsu taustasäikeessä. */
     fun findChats(token: String): List<Pair<String, String>> {
+        if (polling) {
+            // Valvonta on käynnissä ja lukee botin viestit itse: käytetään sen keräämiä tietoja
+            val list = synchronized(seenChats) { seenChats.entries.filter { it.value != null }.map { it.key to it.value!! } }
+            if (list.isEmpty()) throw Exception("Botti ei ole nähnyt viestejä. Kirjoita ryhmään /start ja yritä uudelleen.")
+            return list.reversed().sortedBy { if (it.first.startsWith("-")) 0 else 1 }
+        }
         val conn = URL("https://api.telegram.org/bot${token.trim()}/getUpdates?limit=100").openConnection() as HttpURLConnection
         conn.connectTimeout = 15_000; conn.readTimeout = 20_000
         val code = conn.responseCode
@@ -187,9 +212,9 @@ object Telegram {
         return found.entries.map { it.key to it.value }.sortedBy { if (it.first.startsWith("-")) 0 else 1 }
     }
 
-    private fun get(token: String, method: String, query: String): Pair<Int, String> {
+    private fun get(token: String, method: String, query: String, readTimeout: Int = 20_000): Pair<Int, String> {
         val conn = URL("https://api.telegram.org/bot${token.trim()}/$method?$query").openConnection() as HttpURLConnection
-        conn.connectTimeout = 15_000; conn.readTimeout = 20_000
+        conn.connectTimeout = 15_000; conn.readTimeout = readTimeout
         val code = conn.responseCode
         val body = try {
             (if (code < 400) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""
@@ -255,5 +280,95 @@ object Telegram {
             }
         } catch (_: Exception) {}
         return sb.toString()
+    }
+
+    // ------------------------------------------------------------------ painikkeiden kuuntelu
+
+    class Callback(val id: String, val data: String, val chatId: String, val msgId: Long)
+
+    @Volatile private var polling = false
+    private var pollThread: Thread? = null
+    /** Botin näkemät keskustelut: id -> nimi (null = botti ei enää jäsen). */
+    private val seenChats = LinkedHashMap<String, String?>()
+
+    private fun remember(u: JSONObject) {
+        for (key in listOf("message", "edited_message", "channel_post", "my_chat_member", "chat_member", "callback_query")) {
+            var o = u.optJSONObject(key) ?: continue
+            if (key == "callback_query") o = o.optJSONObject("message") ?: continue
+            val chat = o.optJSONObject("chat") ?: continue
+            val id = chat.get("id").toString()
+            val name = when (chat.optString("type")) {
+                "private" -> "Yksityinen: " + chat.optString("first_name")
+                "group", "supergroup" -> "Ryhmä: " + chat.optString("title")
+                "channel" -> "Kanava: " + chat.optString("title")
+                else -> chat.optString("type")
+            }
+            synchronized(seenChats) {
+                if (o.has("migrate_to_chat_id")) {
+                    seenChats[id] = null
+                    seenChats[o.get("migrate_to_chat_id").toString()] = name
+                    return
+                }
+                val st = if (key == "my_chat_member") o.optJSONObject("new_chat_member")?.optString("status") ?: "" else ""
+                seenChats.remove(id)
+                seenChats[id] = if (st == "left" || st == "kicked") null else name
+            }
+        }
+    }
+
+    /** Kuuntelee botille tulevia painalluksia (long polling). */
+    fun startPolling(c: Context, onCallback: (Callback) -> Unit) {
+        val app = c.applicationContext
+        synchronized(lock) {
+            if (polling) return
+            polling = true
+            pollThread = Thread({ pollLoop(app, onCallback) }, "telegram-poll").apply { isDaemon = true; start() }
+        }
+    }
+
+    fun stopPolling() {
+        polling = false
+        pollThread?.interrupt()
+        pollThread = null
+    }
+
+    private fun pollLoop(c: Context, onCallback: (Callback) -> Unit) {
+        var offset = 0L
+        var first = true
+        while (polling) {
+            try {
+                val token = Prefs.tgToken(c)
+                if (token.isEmpty() || !Prefs.tgEnabled(c)) { Thread.sleep(15_000); continue }
+                // Ensimmäisellä kerralla ohitetaan vanhat painallukset
+                val q = if (first) "offset=-1&timeout=0" else "offset=$offset&timeout=25"
+                val (code, body) = get(token, "getUpdates", q, 40_000)
+                if (code != 200) { Thread.sleep(if (code == 409) 30_000 else 10_000); continue }
+                val arr = JSONObject(body).getJSONArray("result")
+                for (i in 0 until arr.length()) {
+                    val u = arr.getJSONObject(i)
+                    offset = maxOf(offset, u.getLong("update_id") + 1)
+                    remember(u)
+                    if (first) continue
+                    val cb = u.optJSONObject("callback_query") ?: continue
+                    val cbId = cb.optString("id")
+                    val msg = cb.optJSONObject("message")
+                    val data = cb.optString("data")
+                    try {
+                        get(token, "answerCallbackQuery", "callback_query_id=" + URLEncoder.encode(cbId, "UTF-8") +
+                            "&text=" + URLEncoder.encode("Video tulossa ryhmään hetken päästä…", "UTF-8"))
+                    } catch (_: Exception) {}
+                    if (msg != null) {
+                        onCallback(Callback(cbId, data,
+                            msg.optJSONObject("chat")?.get("id")?.toString() ?: "", msg.optLong("message_id")))
+                    }
+                }
+                first = false
+            } catch (_: InterruptedException) {
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "poll", e)
+                try { Thread.sleep(10_000) } catch (_: InterruptedException) { return }
+            }
+        }
     }
 }
