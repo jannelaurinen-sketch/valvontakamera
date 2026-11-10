@@ -1,0 +1,7 @@
+<resources>
+    <color name="launcher_bg">#FF1B2430</color>
+    <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+        <item name="android:colorAccent">#FF4FC3F7</item>
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
+</resources>
