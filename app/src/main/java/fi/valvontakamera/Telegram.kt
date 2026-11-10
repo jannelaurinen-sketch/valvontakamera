@@ -66,6 +66,7 @@ object Telegram {
                 Log.w(TAG, "send", e)
                 RETRY
             }
+            if (res == RETRY_NOW) continue
             if (res == RETRY) {
                 synchronized(lock) { lock.wait(30_000) }
             } else {
@@ -79,6 +80,7 @@ object Telegram {
     private const val OK = 0
     private const val RETRY = 1
     private const val DROP = 2
+    private const val RETRY_NOW = 3
 
     private fun send(c: Context, job: File): Int {
         if (!enabled(c)) return DROP
@@ -100,10 +102,14 @@ object Telegram {
             }
             else -> return DROP
         }
+        val migrated = try {
+            JSONObject(body).optJSONObject("parameters")?.opt("migrate_to_chat_id")?.toString()
+        } catch (_: Exception) { null }
+        if (migrated != null) { Prefs.setTgChat(c, migrated); return RETRY_NOW }
         return when {
             code in 200..299 -> { lastOk = System.currentTimeMillis(); lastError = ""; OK }
             code == 429 || code >= 500 -> { lastError = "HTTP $code"; RETRY }
-            else -> { lastError = "HTTP $code: ${body.take(200)}"; DROP }
+            else -> { lastError = "HTTP $code: " + desc(body).take(200); DROP }
         }
     }
 
@@ -148,13 +154,23 @@ object Telegram {
         if (code != 200) throw Exception("HTTP $code (tarkista token)")
         val arr = JSONObject(body).getJSONArray("result")
         val found = LinkedHashMap<String, String>()
+        val gone = HashSet<String>()
         for (i in arr.length() - 1 downTo 0) {
             val u = arr.getJSONObject(i)
             for (key in listOf("message", "edited_message", "channel_post", "my_chat_member", "chat_member")) {
                 val o = u.optJSONObject(key) ?: continue
                 val chat = o.optJSONObject("chat") ?: continue
                 val id = chat.get("id").toString()
-                if (found.containsKey(id)) continue
+                if (o.has("migrate_to_chat_id")) {   // ryhmä muuttui superryhmäksi: uusi numero
+                    val nid = o.get("migrate_to_chat_id").toString()
+                    if (!found.containsKey(nid)) found[nid] = "Ryhmä: " + chat.optString("title")
+                    gone.add(id)
+                }
+                if (found.containsKey(id) || gone.contains(id)) continue
+                if (key == "my_chat_member") {
+                    val st = o.optJSONObject("new_chat_member")?.optString("status") ?: ""
+                    if (st == "left" || st == "kicked") { gone.add(id); continue }
+                }
                 val type = chat.optString("type")
                 val name = when (type) {
                     "private" -> "Yksityinen: " + listOf(chat.optString("first_name"), chat.optString("last_name"))
@@ -171,15 +187,73 @@ object Telegram {
         return found.entries.map { it.key to it.value }.sortedBy { if (it.first.startsWith("-")) 0 else 1 }
     }
 
-    /** Lähettää testiviestin heti. Kutsu taustasäikeessä. */
-    fun sendNow(token: String, chat: String, text: String) {
-        val q = "chat_id=" + URLEncoder.encode(chat, "UTF-8") + "&text=" + URLEncoder.encode(text, "UTF-8")
-        val conn = URL("https://api.telegram.org/bot${token.trim()}/sendMessage?$q").openConnection() as HttpURLConnection
+    private fun get(token: String, method: String, query: String): Pair<Int, String> {
+        val conn = URL("https://api.telegram.org/bot${token.trim()}/$method?$query").openConnection() as HttpURLConnection
         conn.connectTimeout = 15_000; conn.readTimeout = 20_000
         val code = conn.responseCode
-        if (code != 200) {
-            val b = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
-            throw Exception("HTTP $code ${b.take(150)}")
+        val body = try {
+            (if (code < 400) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""
+        } catch (_: Exception) { "" }
+        conn.disconnect()
+        return code to body
+    }
+
+    private fun desc(body: String): String = try { JSONObject(body).optString("description") } catch (_: Exception) { body }
+
+    /** Telegramin virheen selitys suomeksi. */
+    fun explain(description: String): String {
+        val d = description.lowercase()
+        return when {
+            "not a member" in d -> "Botti ei ole ryhmän jäsen. Lisää botti ryhmään (ryhmän nimi → Lisää jäsen)."
+            "was kicked" in d -> "Botti on poistettu ryhmästä. Lisää se takaisin ryhmään ja hae chat ID uudelleen."
+            "initiate conversation" in d -> "Valittu chat ID on yksityiskeskustelu, jota ei ole aloitettu. Avaa botti Telegramissa ja paina START – tai valitse ryhmä."
+            "chat was deleted" in d || "deactivated" in d -> "Ryhmä on poistettu tai muuttunut. Lähetä ryhmään /start ja hae chat ID uudelleen."
+            "upgraded to a supergroup" in d -> "Ryhmän numero on vaihtunut. Lähetä ryhmään /start ja hae chat ID uudelleen (valitse -100 alkava)."
+            "not enough rights" in d || "have no rights" in d -> "Botilla ei ole oikeutta kirjoittaa ryhmään. Tee botista ryhmän ylläpitäjä."
+            "chat not found" in d -> "Chat ID on väärä. Tyhjennä kenttä ja paina Hae chat ID."
+            "unauthorized" in d || "not found" == d.trim() -> "Token on väärä. Kopioi token uudelleen BotFatherilta."
+            else -> ""
         }
+    }
+
+    /** Lähettää testiviestin heti. Palauttaa null jos onnistui, muuten virheselityksen. Kutsu taustasäikeessä. */
+    fun sendNow(token: String, chat: String, text: String): String? {
+        val q = "chat_id=" + URLEncoder.encode(chat, "UTF-8") + "&text=" + URLEncoder.encode(text, "UTF-8")
+        val (code, body) = get(token, "sendMessage", q)
+        if (code == 200) return null
+        // Superryhmäksi muuttunut ryhmä: kerrotaan uusi numero
+        val newId = try {
+            JSONObject(body).optJSONObject("parameters")?.opt("migrate_to_chat_id")?.toString()
+        } catch (_: Exception) { null }
+        if (newId != null) return "MIGRATE:$newId"
+        val d = desc(body)
+        val sb = StringBuilder("HTTP $code\n$d")
+        val fi = explain(d)
+        if (fi.isNotEmpty()) sb.append("\n\n").append(fi)
+        // Lisädiagnoosi: onko botti ryhmässä?
+        try {
+            val (c1, me) = get(token, "getMe", "")
+            if (c1 == 200) {
+                val r = JSONObject(me).getJSONObject("result")
+                val botId = r.get("id").toString()
+                sb.append("\n\nBotti: @").append(r.optString("username"))
+                val (c2, m) = get(token, "getChatMember",
+                    "chat_id=" + URLEncoder.encode(chat, "UTF-8") + "&user_id=$botId")
+                if (c2 == 200) {
+                    val st = JSONObject(m).getJSONObject("result").optString("status")
+                    sb.append("\nBotin tila ryhmässä: ").append(when (st) {
+                        "administrator" -> "ylläpitäjä"
+                        "member" -> "jäsen"
+                        "restricted" -> "rajoitettu (ei saa kirjoittaa) – tee botista ylläpitäjä"
+                        "left" -> "ei jäsen – lisää botti ryhmään"
+                        "kicked" -> "poistettu/estetty – poista esto ja lisää botti ryhmään"
+                        else -> st
+                    })
+                } else {
+                    sb.append("\nBotti ei pääse ryhmään: ").append(desc(m))
+                }
+            }
+        } catch (_: Exception) {}
+        return sb.toString()
     }
 }

@@ -304,9 +304,21 @@ class MainActivity : Activity() {
         val chat = chatEt.text.toString().trim()
         Prefs.setTgToken(this, token); Prefs.setTgChat(this, chat)
         Thread {
-            val err = try { Telegram.sendNow(token, chat, "✅ Valvontakamera: testiviesti"); null } catch (e: Exception) { e.message }
+            val err = try { Telegram.sendNow(token, chat, "✅ Valvontakamera: testiviesti") } catch (e: Exception) {
+                "Yhteysvirhe: ${e.message}\n\nTarkista että puhelin on Wi-Fi-verkossa."
+            }
             runOnUiThread {
-                Toast.makeText(this, err?.let { "Virhe: $it" } ?: "Testiviesti lähetetty", Toast.LENGTH_LONG).show()
+                when {
+                    err == null -> Toast.makeText(this, "Testiviesti lähetetty", Toast.LENGTH_LONG).show()
+                    err.startsWith("MIGRATE:") -> {
+                        val id = err.removePrefix("MIGRATE:")
+                        chatEt.setText(id); Prefs.setTgChat(this, id)
+                        Toast.makeText(this, "Ryhmän numero oli vaihtunut – korjattu. Paina Testiviesti uudelleen.",
+                            Toast.LENGTH_LONG).show()
+                    }
+                    else -> AlertDialog.Builder(this).setTitle("Testiviesti epäonnistui")
+                        .setMessage(err).setPositiveButton("OK", null).show()
+                }
             }
         }.start()
     }
