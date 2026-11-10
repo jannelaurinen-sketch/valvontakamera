@@ -139,20 +139,36 @@ object Telegram {
         return code to body
     }
 
-    /** Hakee chat ID:n viimeisimmästä botille lähetetystä viestistä. Kutsu taustasäikeessä. */
-    fun findChatId(token: String): String {
-        val conn = URL("https://api.telegram.org/bot${token.trim()}/getUpdates").openConnection() as HttpURLConnection
+    /** Hakee botin näkemät keskustelut ja ryhmät: lista (id, nimi). Kutsu taustasäikeessä. */
+    fun findChats(token: String): List<Pair<String, String>> {
+        val conn = URL("https://api.telegram.org/bot${token.trim()}/getUpdates?limit=100").openConnection() as HttpURLConnection
         conn.connectTimeout = 15_000; conn.readTimeout = 20_000
         val code = conn.responseCode
         val body = (if (code < 400) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""
         if (code != 200) throw Exception("HTTP $code (tarkista token)")
         val arr = JSONObject(body).getJSONArray("result")
+        val found = LinkedHashMap<String, String>()
         for (i in arr.length() - 1 downTo 0) {
             val u = arr.getJSONObject(i)
-            val msg = u.optJSONObject("message") ?: u.optJSONObject("channel_post") ?: continue
-            return msg.getJSONObject("chat").get("id").toString()
+            for (key in listOf("message", "edited_message", "channel_post", "my_chat_member", "chat_member")) {
+                val o = u.optJSONObject(key) ?: continue
+                val chat = o.optJSONObject("chat") ?: continue
+                val id = chat.get("id").toString()
+                if (found.containsKey(id)) continue
+                val type = chat.optString("type")
+                val name = when (type) {
+                    "private" -> "Yksityinen: " + listOf(chat.optString("first_name"), chat.optString("last_name"))
+                        .filter { it.isNotEmpty() }.joinToString(" ")
+                    "group", "supergroup" -> "Ryhmä: " + chat.optString("title")
+                    "channel" -> "Kanava: " + chat.optString("title")
+                    else -> type
+                }
+                found[id] = name
+            }
         }
-        throw Exception("Ei viestejä. Lähetä botille ensin jokin viesti.")
+        if (found.isEmpty()) throw Exception("Botti ei ole nähnyt viestejä. Kirjoita ryhmään /start ja yritä uudelleen.")
+        // ryhmät ensin
+        return found.entries.map { it.key to it.value }.sortedBy { if (it.first.startsWith("-")) 0 else 1 }
     }
 
     /** Lähettää testiviestin heti. Kutsu taustasäikeessä. */

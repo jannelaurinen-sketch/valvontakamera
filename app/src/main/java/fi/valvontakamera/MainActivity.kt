@@ -161,7 +161,7 @@ class MainActivity : Activity() {
         chatEt = EditText(this).apply {
             hint = "Chat ID"
             setText(Prefs.tgChat(this@MainActivity))
-            inputType = InputType.TYPE_CLASS_TEXT
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
             setTextColor(Color.WHITE); setHintTextColor(Color.GRAY)
         }
         col.add(chatEt)
@@ -279,12 +279,18 @@ class MainActivity : Activity() {
         val token = tokenEt.text.toString().trim()
         if (token.isEmpty()) { Toast.makeText(this, "Syötä ensin token", Toast.LENGTH_SHORT).show(); return }
         Thread {
-            val res = try { Result.success(Telegram.findChatId(token)) } catch (e: Exception) { Result.failure(e) }
+            val res = try { Result.success(Telegram.findChats(token)) } catch (e: Exception) { Result.failure(e) }
             runOnUiThread {
-                res.onSuccess {
-                    chatEt.setText(it)
-                    Prefs.setTgToken(this, token); Prefs.setTgChat(this, it)
-                    Toast.makeText(this, "Chat ID löytyi: $it", Toast.LENGTH_SHORT).show()
+                res.onSuccess { chats ->
+                    val labels = chats.map { "${it.second}\n${it.first}" }.toTypedArray()
+                    AlertDialog.Builder(this).setTitle("Valitse mihin hälytykset lähetetään")
+                        .setItems(labels) { _, i ->
+                            val id = chats[i].first
+                            chatEt.setText(id)
+                            Prefs.setTgToken(this, token); Prefs.setTgChat(this, id)
+                            Toast.makeText(this, "Valittu: ${chats[i].second}", Toast.LENGTH_SHORT).show()
+                        }
+                        .setNegativeButton("Peruuta", null).show()
                 }.onFailure {
                     AlertDialog.Builder(this).setTitle("Chat ID:tä ei löytynyt")
                         .setMessage(it.message).setPositiveButton("OK", null).show()
