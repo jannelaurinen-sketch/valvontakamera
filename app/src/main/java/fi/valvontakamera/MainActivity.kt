@@ -169,6 +169,9 @@ class MainActivity : Activity() {
             button("Hae chat ID") { findChat() },
             button("Testiviesti") { testTg() }
         ))
+        col.add(label("Ryhmän komennot (toimivat kun valvonta on käynnissä):\n" +
+                "/kuva – kuva pihalta nyt\n/video – 10 s video nyt (esim. /video 30)\n" +
+                "/tila – kameran tila\n/valo – puhelimen valo päälle/pois", 13f, color = Color.GRAY))
 
         // ---------------- Taustatoiminta
         col.add(header("Taustatoiminta"))

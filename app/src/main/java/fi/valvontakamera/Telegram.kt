@@ -286,6 +286,9 @@ object Telegram {
 
     class Callback(val id: String, val data: String, val chatId: String, val msgId: Long)
 
+    /** Ryhmästä tullut komento, esim. /kuva tai /video 20. */
+    class Command(val cmd: String, val arg: String, val chatId: String, val msgId: Long, val from: String)
+
     @Volatile private var polling = false
     private var pollThread: Thread? = null
     /** Botin näkemät keskustelut: id -> nimi (null = botti ei enää jäsen). */
@@ -317,13 +320,22 @@ object Telegram {
     }
 
     /** Kuuntelee botille tulevia painalluksia (long polling). */
-    fun startPolling(c: Context, onCallback: (Callback) -> Unit) {
+    fun startPolling(c: Context, onCallback: (Callback) -> Unit, onCommand: (Command) -> Unit) {
         val app = c.applicationContext
         synchronized(lock) {
             if (polling) return
             polling = true
-            pollThread = Thread({ pollLoop(app, onCallback) }, "telegram-poll").apply { isDaemon = true; start() }
+            pollThread = Thread({ pollLoop(app, onCallback, onCommand) }, "telegram-poll").apply { isDaemon = true; start() }
         }
+    }
+
+    private fun registerCommands(token: String) {
+        val cmds = JSONArray()
+            .put(JSONObject().put("command", "kuva").put("description", "Kuva pihalta juuri nyt"))
+            .put(JSONObject().put("command", "video").put("description", "Video tästä hetkestä (oletus 10 s, esim. /video 30)"))
+            .put(JSONObject().put("command", "tila").put("description", "Kameran tila"))
+            .put(JSONObject().put("command", "valo").put("description", "Puhelimen valo päälle/pois"))
+        try { get(token, "setMyCommands", "commands=" + URLEncoder.encode(cmds.toString(), "UTF-8")) } catch (_: Exception) {}
     }
 
     fun stopPolling() {
@@ -332,7 +344,7 @@ object Telegram {
         pollThread = null
     }
 
-    private fun pollLoop(c: Context, onCallback: (Callback) -> Unit) {
+    private fun pollLoop(c: Context, onCallback: (Callback) -> Unit, onCommand: (Command) -> Unit) {
         var offset = 0L
         var first = true
         while (polling) {
@@ -340,6 +352,7 @@ object Telegram {
                 val token = Prefs.tgToken(c)
                 if (token.isEmpty() || !Prefs.tgEnabled(c)) { Thread.sleep(15_000); continue }
                 // Ensimmäisellä kerralla ohitetaan vanhat painallukset
+                if (first) registerCommands(token)
                 val q = if (first) "offset=-1&timeout=0" else "offset=$offset&timeout=25"
                 val (code, body) = get(token, "getUpdates", q, 40_000)
                 if (code != 200) { Thread.sleep(if (code == 409) 30_000 else 10_000); continue }
@@ -349,6 +362,19 @@ object Telegram {
                     offset = maxOf(offset, u.getLong("update_id") + 1)
                     remember(u)
                     if (first) continue
+                    val m = u.optJSONObject("message")
+                    val txt = m?.optString("text") ?: ""
+                    if (m != null && txt.startsWith("/")) {
+                        val chatId = m.optJSONObject("chat")?.get("id")?.toString() ?: ""
+                        // Komennot hyväksytään vain asetetusta ryhmästä/keskustelusta
+                        if (chatId == Prefs.tgChat(c)) {
+                            val head = txt.trim().substringBefore(' ').removePrefix("/").substringBefore('@').lowercase()
+                            val arg = txt.trim().substringAfter(' ', "").trim()
+                            val from = m.optJSONObject("from")?.optString("first_name") ?: ""
+                            onCommand(Command(head, arg, chatId, m.optLong("message_id"), from))
+                        }
+                        continue
+                    }
                     val cb = u.optJSONObject("callback_query") ?: continue
                     val cbId = cb.optString("id")
                     val msg = cb.optJSONObject("message")

@@ -120,6 +120,7 @@ class CameraService : LifecycleService() {
     private val recentEvents = ArrayList<LongArray>()
     private val pendingClips = ArrayList<LongArray>()   // start, end, vastattava viesti-id
     private val requested = HashMap<Long, Long>()      // tapahtuman alku -> pyyntöaika
+    @Volatile private var stillRequest = false
     private var activeEventStart = 0L
     private var transforming = false
     private var wakeLock: PowerManager.WakeLock? = null
@@ -170,7 +171,9 @@ class CameraService : LifecycleService() {
         Storage.cleanup(this, Prefs.keepNights(this), MIN_FREE)
         Storage.appendSession(this, "S", System.currentTimeMillis())
         Telegram.text(this, "📹 Valvonta käynnistyi")
-        Telegram.startPolling(this) { cb -> main.post { onVideoRequest(cb) } }
+        Telegram.startPolling(this,
+            { cb -> main.post { onVideoRequest(cb) } },
+            { cmd -> main.post { onCommand(cmd) } })
 
         val f = ProcessCameraProvider.getInstance(this)
         f.addListener({
@@ -393,15 +396,61 @@ class CameraService : LifecycleService() {
         if (prev != null && now - prev < 10 * 60_000L) return   // sama video jo pyydetty
         requested[st] = now
         requested.entries.removeAll { now - it.value > 3_600_000L }
-        pendingClips.add(longArrayOf(st, en, cb.msgId))
+        pendingClips.add(longArrayOf(st, en, cb.msgId, 0L))
         processClips()
+    }
+
+    /** Telegram-ryhmän komennot. */
+    private fun onCommand(cmd: Telegram.Command) {
+        if (!running || stopping) return
+        when (cmd.cmd) {
+            "kuva", "photo" -> stillRequest = true
+            "video", "live" -> {
+                val sec = (cmd.arg.filter { it.isDigit() }.toIntOrNull() ?: 10).coerceIn(3, 60)
+                val now = System.currentTimeMillis()
+                val end = now + sec * 1000L
+                // pidetään tämän jakson videopätkät tallessa
+                recentEvents.add(longArrayOf(now + PRE_MS, end - POST_MS))
+                Telegram.text(this, "🎥 Kuvataan $sec s, video tulee pian…")
+                pendingClips.add(longArrayOf(now, end, cmd.msgId, 1L))
+                // katkaistaan nauhoitus jakson lopussa, jotta video saadaan heti
+                main.postDelayed({
+                    if (running && !stopping && activeRecStart < end) activeRecording?.stop()
+                }, sec * 1000L + 500)
+            }
+            "tila", "status" -> {
+                val sb = StringBuilder("📊 Valvonta käynnissä\n")
+                if (resolutionText.isNotEmpty()) sb.append("Video $resolutionText\n")
+                sb.append("Tapahtumia: $eventsCount\n")
+                if (lastMotionAt > 0) sb.append("Viimeisin liike: ${Fmt.dateTime(lastMotionAt)}\n")
+                if (batteryText.isNotEmpty()) sb.append(batteryText).append("\n")
+                sb.append("Valo: ${if (torchOn) "päällä" else "pois"}\n")
+                sb.append("Vapaata muistia: ${Fmt.size(Storage.root(this).usableSpace)}")
+                if (errorText.isNotEmpty()) sb.append("\n⚠ $errorText")
+                Telegram.text(this, sb.toString())
+            }
+            "valo", "light" -> {
+                val on = when (cmd.arg.lowercase()) {
+                    "päälle", "on", "1" -> true
+                    "pois", "off", "0" -> false
+                    else -> !torchOn
+                }
+                Prefs.setTorch(this, on)
+                applyTorch(on)
+                Telegram.text(this, if (on) "💡 Valo päällä" else "🌑 Valo pois")
+            }
+            "start", "apua", "help" -> Telegram.text(this,
+                "Komennot:\n/kuva – kuva pihalta nyt\n/video – 10 s video nyt (esim. /video 30)\n" +
+                "/tila – kameran tila\n/valo – puhelimen valo päälle/pois")
+        }
     }
 
     private fun processClips() {
         if (transforming || pendingClips.isEmpty()) return
         val ev = pendingClips[0]
-        val cs = ev[0] - PRE_MS
-        val ce = minOf(ev[1] + POST_MS, cs + CLIP_MAX_MS)
+        val live = ev.size > 3 && ev[3] == 1L
+        val cs = if (live) ev[0] else ev[0] - PRE_MS
+        val ce = if (live) ev[1] else minOf(ev[1] + POST_MS, cs + CLIP_MAX_MS)
         if (activeRecStart <= ce) return                  // jakso vielä nauhoituksessa
         if (pendingSegs.any { it.start <= ce && it.end >= cs }) return
         pendingClips.removeAt(0)
@@ -412,7 +461,8 @@ class CameraService : LifecycleService() {
         }
         transforming = true
         val out = File(cacheDir, "klippi_${ev[0]}.mp4")
-        val caption = "🎬 ${Fmt.time(ev[0])}–${Fmt.time(ev[1])} (${(ev[1] - ev[0]) / 1000 + 1} s)"
+        val caption = if (live) "🎥 Nyt ${Fmt.time(ev[0])} (${(ev[1] - ev[0]) / 1000} s)"
+                      else "🎬 ${Fmt.time(ev[0])}–${Fmt.time(ev[1])} (${(ev[1] - ev[0]) / 1000 + 1} s)"
         ClipMaker.make(this, segs, cs, ce, out) { ok, err ->
             transforming = false
             if (ok && out.exists()) Telegram.video(this, out, caption, ev[2])
@@ -450,6 +500,17 @@ class CameraService : LifecycleService() {
                 curSec = sec; secMax = 0f
             }
             if (r.score > secMax) secMax = r.score
+
+            if (stillRequest) {
+                stillRequest = false
+                try {
+                    val w = image.width and 1.inv(); val h = image.height and 1.inv()
+                    val buf = ByteArray(w * h * 3 / 2)
+                    toNv21(image, w, h, buf)
+                    val f = saveJpeg(buf, w, h, image.imageInfo.rotationDegrees, now, "kuva_$now.jpg")
+                    main.post { Telegram.photo(this, f, "📷 Nyt ${Fmt.dateTime(now)}") }
+                } catch (t: Throwable) { Log.w(TAG, "kuva", t) }
+            }
 
             if (r.triggered) {
                 if (evStart == 0L) {
@@ -550,9 +611,10 @@ class CameraService : LifecycleService() {
     }
 
     /** Tallentaa talteen otetun kuvan JPEG-tiedostoksi aikaleiman kanssa. */
-    private fun saveBest(): File {
-        val nv21 = bestNv21!!
-        val w = bestW; val h = bestH; val now = bestAt
+    private fun saveBest(): File = saveJpeg(bestNv21!!, bestW, bestH, bestRot, bestAt, "still_$bestAt.jpg")
+
+    private fun saveJpeg(nv21: ByteArray, w: Int, h: Int, rot: Int, now: Long, name: String): File {
+        val bestRot = rot
         val baos = ByteArrayOutputStream()
         YuvImage(nv21, ImageFormat.NV21, w, h, null).compressToJpeg(Rect(0, 0, w, h), 92, baos)
         var bmp = BitmapFactory.decodeByteArray(baos.toByteArray(), 0, baos.size())
@@ -567,7 +629,7 @@ class CameraService : LifecycleService() {
             setShadowLayer(4f, 2f, 2f, Color.BLACK)
         }
         c.drawText(Fmt.stamp(now), paint.textSize * 0.5f, bmp.height - paint.textSize * 0.6f, paint)
-        val f = File(Storage.nightDir(this, now), "still_$now.jpg")
+        val f = File(Storage.nightDir(this, now), name)
         FileOutputStream(f).use { bmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }
         return f
     }
